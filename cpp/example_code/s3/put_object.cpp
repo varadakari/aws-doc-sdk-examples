@@ -1,116 +1,76 @@
-// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-
-#include <iostream>
-#include <fstream>
-#include <sys/stat.h>
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/PutObjectRequest.h>
-#include "s3_examples.h"
+#include <fstream>
+#include <iostream>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/utils/logging/ConsoleLogSystem.h>
+#include <aws/core/utils/logging/LogMacros.h>
 
-/**
- * Before running this C++ code example, set up your development environment, including your credentials.
- *
- * For more information, see the following documentation topic:
- *
- * https://docs.aws.amazon.com/sdk-for-cpp/v1/developer-guide/getting-started.html
- *
- * Purpose
- *
- * Demonstrates using the AWS SDK for C++ to put an object in an S3 bucket.
-  *
- */
+using namespace Aws;
+using namespace Aws::Auth;
 
-//! Routine which demonstrates putting an object in an S3 bucket.
-/*!
-  \param bucketName: Name of the bucket.
-  \param fileName: Name of the file to put in the bucket.
-  \param clientConfig: Aws client configuration.
-  \return bool: Function succeeded.
-*/
-
-// snippet-start:[s3.cpp.put_object.code]
-bool AwsDoc::S3::putObject(const Aws::String &bucketName,
-                           const Aws::String &fileName,
-                           const Aws::S3::S3ClientConfiguration &clientConfig) {
-    Aws::S3::S3Client s3Client(clientConfig);
-
-    Aws::S3::Model::PutObjectRequest request;
-    request.SetBucket(bucketName);
-    //We are using the name of the file as the key for the object in the bucket.
-    //However, this is just a string and can be set according to your retrieval needs.
-    request.SetKey(fileName);
-
-    std::shared_ptr<Aws::IOStream> inputData =
-            Aws::MakeShared<Aws::FStream>("SampleAllocationTag",
-                                          fileName.c_str(),
-                                          std::ios_base::in | std::ios_base::binary);
-
-    if (!*inputData) {
-        std::cerr << "Error unable to read file " << fileName << std::endl;
-        return false;
-    }
-
-    request.SetBody(inputData);
-
-    Aws::S3::Model::PutObjectOutcome outcome =
-            s3Client.PutObject(request);
-
-    if (!outcome.IsSuccess()) {
-        std::cerr << "Error: putObject: " <<
-                  outcome.GetError().GetMessage() << std::endl;
-    } else {
-        std::cout << "Added object '" << fileName << "' to bucket '"
-                  << bucketName << "'.";
-    }
-
-    return outcome.IsSuccess();
-}
-// snippet-end:[s3.cpp.put_object.code]
-
-/*
- *
- * main function
- *
- * Prerequisites: S3 bucket for the object.
- *
- * usage: run_put_object <object_name> <bucket_name>
- *
- */
-
-#ifndef EXCLUDE_MAIN_FUNCTION
-
-int main(int argc, char* argv[])
-{
-    if (argc != 3)
-    {
-        std::cout << R"(
-Usage:
-    run_put_object <file_name> <bucket_name>
-Where:
-    file_name - The name of the file to upload.
-    bucket_name - The name of the bucket to upload the object to.
-)" << std::endl;
-        return 1;
-    }
-
+int main(int argc, char **argv) {
     Aws::SDKOptions options;
+#if 0
+    options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
+    // Create a ConsoleLogSystem with desired log level
+    auto consoleLogger = Aws::MakeShared<Aws::Utils::Logging::ConsoleLogSystem>("ConsoleLogger", Aws::Utils::Logging::LogLevel::Trace);
+
+    // Set the logger in SDK options
+    options.loggingOptions.logger_create_fn = [consoleLogger]() { return consoleLogger; };
+#endif
     Aws::InitAPI(options);
     {
-        const Aws::String fileName = argv[1];
-        const Aws::String bucketName = argv[2];
+	if( argc < 5 ) {
+	    printf("%s <bucket name> <key> <file> <endpoint url>\n", argv[0]);
+	    exit(1);
+        }
 
-        Aws::S3::S3ClientConfiguration clientConfig;
-        // Optional: Set to the AWS Region in which the bucket was created (overrides config file).
-        // clientConfig.region = "us-east-1";
+        Aws::String bucket_name = argv[1];
+        Aws::String object_key = argv[2];       // The name for the object in S3
+        Aws::String file_name = argv[3];      // The path to your local file
+        Aws::String endpoint_url = argv[4];  // Custom endpoint
+        Aws::String region = "us-east-1";             // Region (used for signing)
 
-        AwsDoc::S3::putObject(bucketName, fileName, clientConfig);
+        Aws::Client::ClientConfiguration clientConfig;
+        clientConfig.region = region;
+        clientConfig.endpointOverride = endpoint_url;
+        clientConfig.scheme = Aws::Http::Scheme::HTTPS;
+        clientConfig.verifySSL = true; // Disable only if using self-signed certs
+        clientConfig.caFile = "/home/ubuntu/varada/minio.crt";
+	const Aws::String access_key_ = "minioadmin";
+        const Aws::String secret_key_ = "minioadmin";
+
+        
+	Aws::S3::S3Client s3_client(Aws::Auth::AWSCredentials(access_key_.data(), secret_key_.data()),
+			 	    clientConfig,
+                                    Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+                                    false);
+
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(bucket_name);
+        request.SetKey(object_key);
+
+        auto input_data = Aws::MakeShared<Aws::FStream>("PutObjectInputStream", file_name.c_str(), std::ios_base::in | std::ios_base::binary);
+
+        if (!input_data->good()) {
+            std::cerr << "Failed to open file " << file_name << std::endl;
+            return 1;
+        }
+        request.SetBody(input_data);
+
+	printf("Setting the object \n");
+
+        auto outcome = s3_client.PutObject(request);
+
+        if (outcome.IsSuccess()) {
+            std::cout << "Successfully uploaded " << object_key << " to " << bucket_name << std::endl;
+        } else {
+            std::cerr << "Upload failed: " << outcome.GetError().GetMessage() << std::endl;
+        }
     }
-
     Aws::ShutdownAPI(options);
-
     return 0;
 }
 
-#endif  // EXCLUDE_MAIN_FUNCTION
