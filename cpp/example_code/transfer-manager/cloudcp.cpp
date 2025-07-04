@@ -76,9 +76,6 @@ int UploadFile(std::shared_ptr<Aws::Transfer::TransferManager> transferManager,
                const std::string& bucket,
                const std::string& s3_key) {
 
-
-    std::cout << " File: " << file_path << " bucket: " << bucket <<" key: " << s3_key << std::endl;
-
     struct stat st;
     if (stat(file_path.c_str(), &st) != 0) {
         std::cerr << "File stat failed\n";
@@ -98,7 +95,7 @@ int UploadFile(std::shared_ptr<Aws::Transfer::TransferManager> transferManager,
     handle->WaitUntilFinished();
 
     if (handle->GetStatus() == Aws::Transfer::TransferStatus::COMPLETED) {
-        std::cout << "Uploaded: " << s3_key << std::endl;
+        //std::cout << "Uploaded: " << s3_key << std::endl;
     } else {
         std::cerr << "Failed: " << s3_key
                   << " Error: " << handle->GetLastError().GetMessage() << std::endl;
@@ -129,8 +126,8 @@ int DownloadFile(std::shared_ptr<Aws::Transfer::TransferManager> transferManager
     handle->WaitUntilFinished();
 
     if (handle->GetStatus() == Aws::Transfer::TransferStatus::COMPLETED) {
-        std::cout << "Download succeeded: " << full_path << std::endl;
-        std::cout << "Etag: " << handle->GetEtag() << std::endl;
+        //std::cout << "Download succeeded: " << full_path << std::endl;
+        //std::cout << "Etag: " << handle->GetEtag() << std::endl;
     } else {
         std::cerr << "Download failed. Status: "
                   << static_cast<int>(handle->GetStatus()) << std::endl;
@@ -152,27 +149,43 @@ int main(int argc, char** argv) {
         std::string endpointUrl;
         std::vector<std::string> positionalArgs;
 
-	for (int i = 1; i < argc; ++i) {
+        for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--endpoint-url" && i + 1 < argc) {
-                endpointUrl = argv[++i];
-            } else if (arg.rfind("-", 0) != 0) {
-                // Only accept non-option args as positional args
-                positionalArgs.push_back(arg);
-                if (positionalArgs.size() >= 2) break; // Stop collecting after src and dst
+
+            if (arg == "--endpoint-url") {
+                if (i + 1 < argc) {
+                    endpointUrl = argv[++i];
+                } else {
+                    std::cerr << "--endpoint-url requires a value\n";
+                    Aws::ShutdownAPI(options);
+                    return 1;
+                }
+            } else if (arg.rfind("-", 0) == 0) {
+                // Unknown option, skip silently
+                continue;
+            } else {
+                // Positional argument
+                if (positionalArgs.size() < 2) {
+                    positionalArgs.push_back(arg);
+                } else {
+                    // More than two positional args, ignore or handle error if needed
+                    // For now, just ignore extra positional args
+                }
             }
         }
 
-	if (positionalArgs.size() != 2) {
+
+        if (positionalArgs.size() != 2) {
             std::cerr << "Usage:\n"
-                      << "  cloudcp [--endpoint-url <url>] /path/to/file s3://bucket[/prefix/]\n"
-                      << "  cloudcp [--endpoint-url <url>] s3://bucket[/prefix/] /path/to/file\n";
+                  << "  cloudcp [--endpoint-url <url>] /path/to/file s3://bucket[/prefix/]\n"
+                  << "  cloudcp [--endpoint-url <url>] s3://bucket[/prefix/] /path/to/file\n";
             Aws::ShutdownAPI(options);
             return 1;
         }
 
         std::string src = positionalArgs[0];
         std::string dst = positionalArgs[1];
+    	bool isMinIO = false;
 
         Aws::Client::ClientConfiguration config;
         config.scheme = Aws::Http::Scheme::HTTPS;
@@ -181,32 +194,32 @@ int main(int argc, char** argv) {
         config.connectTimeoutMs = 10000;   // connection timeout
         config.enableClockSkewAdjustment = true;
         config.maxConnections = 64;
-        config.endpointOverride = "10.10.10.155:9000";  // MinIO endpoint
-        config.region = "us-east-1";  // MinIO default region
         if (!endpointUrl.empty()) {
             config.endpointOverride = endpointUrl.c_str();
         }
         const std::string ca_cert_path = "/usr/local/share/ca-certificates/minio.crt";
         if (file_exists(ca_cert_path)) {
+            isMinIO = true;
             config.caFile = ca_cert_path;
         }
 
-        // Add credentials explicitly (MinIO uses access/secret keys)
-        Aws::Auth::AWSCredentials credentials("minioadmin", "minioadmin");
-        
-        // Create S3 client with credentials and path-style addressing
-        auto s3_client = std::make_shared<Aws::S3::S3Client>(
-            credentials,
-            config,
-            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-            true  // Enable virtual hosting = false (use path-style)
-        );
+        std::shared_ptr<Aws::S3::S3Client> s3_client;
+        if (isMinIO) {
+            s3_client = std::make_shared<Aws::S3::S3Client>(
+                config,
+                Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+                true  // path-style access
+            );
+        } else {
+            s3_client = std::make_shared<Aws::S3::S3Client>(config);  // default AWS behavior
+        }
+
 
         // Configure TransferManager
         auto executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("ExecutorTag", 16);
         Aws::Transfer::TransferManagerConfiguration transferConfig(executor.get());
         transferConfig.s3Client = s3_client;
-        transferConfig.bufferSize = 5 * 1024 * 1024;  // 5MB (MinIO minimum part size)
+        transferConfig.bufferSize = 50 * 1024 * 1024;
 
         auto transferManager = Aws::Transfer::TransferManager::Create(transferConfig);
 
@@ -229,6 +242,7 @@ int main(int argc, char** argv) {
                 Aws::ShutdownAPI(options);
                 return 1;
             }
+#if 0
             Aws::S3::Model::HeadObjectRequest headRequest;
             headRequest.SetBucket(bucket);
             headRequest.SetKey(key);
@@ -240,11 +254,14 @@ int main(int argc, char** argv) {
             } else {
                 std::cerr << "Failed to get ETag: " << headOutcome.GetError().GetMessage() << std::endl;
             }
+#endif
         } else {
             std::cerr << "Invalid source or destination. One must be s3://bucket/key\n";
             Aws::ShutdownAPI(options);
             return 1;
         }
+	transferManager.reset();
+	s3_client.reset();
     }
     Aws::ShutdownAPI(options);
     return 0;

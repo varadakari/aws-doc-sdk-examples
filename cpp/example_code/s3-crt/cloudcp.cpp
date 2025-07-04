@@ -1,4 +1,5 @@
 #include <aws/core/Aws.h>
+#include <aws/crt/Api.h>
 #include <aws/s3-crt/S3CrtClient.h>
 #include <aws/s3-crt/model/CreateMultipartUploadRequest.h>
 #include <aws/s3-crt/model/UploadPartRequest.h>
@@ -6,6 +7,8 @@
 #include <aws/s3-crt/model/PutObjectRequest.h>
 #include <aws/s3-crt/model/GetObjectRequest.h>
 #include <aws/s3-crt/model/HeadObjectRequest.h>
+#include <aws/s3-crt/model/GetBucketLocationRequest.h>
+#include <aws/s3-crt/model/BucketLocationConstraint.h>
 #include <aws/core/utils/memory/stl/AWSStreamFwd.h>
 #include <aws/core/utils/FileSystemUtils.h>
 #include <aws/core/utils/StringUtils.h>
@@ -26,6 +29,10 @@
 #include <memory>
 #include <regex>
 #include <dirent.h>
+#include <sys/resource.h>
+#include <csignal>
+#include <cstdlib>
+#include <execinfo.h>
 
 bool parseS3Uri(const std::string& uri, std::string& bucket, std::string& prefix, std::string& objectKey) {
     const std::string prefix_str = "s3://";
@@ -87,6 +94,7 @@ int UploadFile(const std::string& bucket, const std::string& object_key, const s
         std::cerr << "Failed to open file: " << file_path << std::endl;
         return 1;
     }
+    input_data->rdbuf()->pubsetbuf(nullptr, 0);
     request.SetBody(input_data);
 
     auto outcome = client.PutObject(request);
@@ -142,7 +150,9 @@ bool file_exists(const std::string& path) {
     return (stat(path.c_str(), &buffer) == 0);
 }
 
-int main(int argc, char** argv) {
+
+int main(int argc, char** argv)
+{
     Aws::SDKOptions options;
     Aws::InitAPI(options);
     {
@@ -185,13 +195,16 @@ int main(int argc, char** argv) {
         std::string src = positionalArgs[0];
         std::string dst = positionalArgs[1];
 
-
         Aws::S3Crt::S3CrtClientConfiguration config;
         config.scheme = Aws::Http::Scheme::HTTPS;
         config.verifySSL = true; // use with caution
         config.useVirtualAddressing = false; // for non-AWS S3
         config.enableTcpKeepAlive = true;
         config.tcpKeepAliveIntervalMs = 30000;
+        config.requestTimeoutMs = 60000;   // 60 seconds or higher as needed
+        config.connectTimeoutMs = 10000;   // connection timeout
+	config.partSize = 8 * 1024 * 1024;
+	config.downloadMemoryUsageWindow = 512 * 1024 * 1024; // 512 MB
         if (!endpointUrl.empty()) {
             config.endpointOverride = endpointUrl.c_str();
         }
@@ -200,10 +213,9 @@ int main(int argc, char** argv) {
             config.caFile = ca_cert_path;
         }
 
-        //std::shared_ptr<S3CrtClient> client = Aws::MakeShared<S3CrtClient>("S3CRTClient", creds, config);
         Aws::S3Crt::S3CrtClient s3(config);
 
-        std::string bucket, prefix, objectKey;
+        std::string prefix, bucket, objectKey;
 
         if (parseS3Uri(src, bucket, prefix, objectKey)) {
             // Download

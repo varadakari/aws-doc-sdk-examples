@@ -1,0 +1,231 @@
+#include <aws/core/Aws.h>
+#include <aws/s3/S3Client.h>
+#include <aws/core/utils/threading/Executor.h>
+#include <aws/transfer/TransferManager.h>
+#include <aws/transfer/TransferHandle.h>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <thread>
+
+bool parseS3Uri(const std::string& uri, std::string& bucket, std::string& key) {
+    const std::string prefix = "s3://";
+    if (uri.substr(0, prefix.length()) != prefix) return false;
+    std::string rest = uri.substr(prefix.length());
+    size_t slash = rest.find('/');
+    if (slash == std::string::npos) return false;
+    bucket = rest.substr(0, slash);
+    key = rest.substr(slash + 1);
+    return true;
+}
+
+bool make_parent_dirs(const std::string& filepath) {
+    size_t pos = 0;
+    do {
+        pos = filepath.find_first_of('/', pos + 1);
+        std::string dir = filepath.substr(0, pos);
+        if (dir.empty()) continue;
+        struct stat st;
+        if (stat(dir.c_str(), &st) != 0) {
+            if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+                std::cerr << "mkdir failed for " << dir << ": " << strerror(errno) << "\n";
+                return false;
+            }
+        } else if (!S_ISDIR(st.st_mode)) {
+            std::cerr << dir << " exists but is not a directory\n";
+            return false;
+        }
+    } while (pos != std::string::npos);
+    return true;
+}
+
+void PrintUsage() {
+    std::cout << "Usage:\n"
+              << "  cloudcp_transfer upload <local_file_path> <s3_bucket> <s3_key> [endpoint_url]\n"
+              << "  cloudcp_transfer download <s3_bucket> <s3_key> <local_file_path> [endpoint_url]\n";
+}
+
+std::shared_ptr<Aws::S3::S3Client> CreateS3Client(const std::string& endpoint_url = "") {
+    Aws::Client::ClientConfiguration config;
+    config.scheme = Aws::Http::Scheme::HTTPS;
+    config.verifySSL = true; // Disable only if using self-signed certs
+    config.requestTimeoutMs = 60000;   // 30 seconds or higher as needed
+    config.connectTimeoutMs = 10000;   // connection timeout
+    config.region = "us-east-1";
+    std::cout << " endpoint url" << endpoint_url << std::endl;
+    if (!endpoint_url.empty()) {
+        config.endpointOverride = endpoint_url.c_str();
+    }
+
+    return std::shared_ptr<Aws::S3::S3Client>(new Aws::S3::S3Client(config,
+			   Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, false));
+}
+
+std::shared_ptr<Aws::Transfer::TransferManager> CreateTransferManager(std::shared_ptr<Aws::S3::S3Client> s3Client) {
+    auto executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>("executor", 25);
+    Aws::Transfer::TransferManagerConfiguration transferConfig(executor.get());
+
+    unsigned int concurrency = std::thread::hardware_concurrency();
+    if (concurrency == 0) concurrency = 4; // fallback
+
+    transferConfig.s3Client = s3Client;
+    transferConfig.transferBufferMaxHeapSize = 64 * 1024 * 1024;  // 64 MB
+    transferConfig.bufferSize = 8 * 1024 * 1024; // 8MB
+
+    return Aws::Transfer::TransferManager::Create(transferConfig);
+}
+
+bool UploadFile(const std::string& local_file, const std::string& bucket, const std::string& key,
+                std::shared_ptr<Aws::Transfer::TransferManager> transferManager) {
+    std::cout << "Uploading " << local_file << " to s3://" << bucket << "/" << key << std::endl;
+    auto handle = transferManager->UploadFile(local_file.c_str(), bucket.c_str(), key.c_str(), "application/octet-stream", Aws::Map<Aws::String, Aws::String>());
+#if 0
+    auto handle = transferManager->UploadFile(
+            localPath.c_str(),
+            bucketName.c_str(),
+            s3Key.c_str(),
+            "application/octet-stream",
+            Aws::Map<Aws::String, Aws::String>());
+#endif
+
+
+    handle->WaitUntilFinished();
+
+    if (handle->GetStatus() == Aws::Transfer::TransferStatus::COMPLETED) {
+        std::cout << "Upload completed successfully.\n";
+        return true;
+    } else {
+        std::cerr << "Upload failed: " << handle->GetLastError().GetMessage() << "\n";
+        return false;
+    }
+}
+
+bool DownloadFile(const std::string& bucket, const std::string& key, const std::string& local_file,
+                  std::shared_ptr<Aws::Transfer::TransferManager> transferManager) {
+    std::cout << "Downloading s3://" << bucket << "/" << key << " to " << local_file << std::endl;
+
+    if (!make_parent_dirs(local_file)) {
+        std::cerr << "Failed to create parent directories for " << local_file << "\n";
+        return false;
+    }
+
+    auto handle = transferManager->DownloadFile(bucket.c_str(), key.c_str(), local_file.c_str());
+
+    handle->WaitUntilFinished();
+
+    if (handle->GetStatus() == Aws::Transfer::TransferStatus::COMPLETED) {
+        std::cout << "Download completed successfully.\n";
+        return true;
+    } else {
+        std::cerr << "Download failed: " << handle->GetLastError().GetMessage() << "\n";
+        return false;
+    }
+}
+
+#if 0
+int main(int argc, char** argv) {
+    if (argc < 5) {
+        PrintUsage();
+        return 1;
+    }
+
+    Aws::SDKOptions options;
+    Aws::InitAPI(options);
+    int ret = 0;
+    {
+        std::string mode = argv[1];
+        std::string endpoint_url;
+        bool hasEndpoint = false;
+
+        if (argc == 6) {
+            endpoint_url = argv[5];
+            hasEndpoint = true;
+        }
+
+        std::shared_ptr<Aws::S3::S3Client> s3Client = hasEndpoint ? CreateS3Client(endpoint_url) : CreateS3Client();
+        std::shared_ptr<Aws::Transfer::TransferManager> transferManager = CreateTransferManager(s3Client);
+
+        if (mode == "upload") {
+            std::string local_file = argv[2];
+            std::string bucket = argv[3];
+            std::string key = argv[4];
+
+            if (!UploadFile(local_file, bucket, key, transferManager)) {
+                ret = 1;
+            }
+        } else if (mode == "download") {
+            std::string bucket = argv[2];
+            std::string key = argv[3];
+            std::string local_file = argv[4];
+
+            if (!DownloadFile(bucket, key, local_file, transferManager)) {
+                ret = 1;
+            }
+        } else {
+            PrintUsage();
+            ret = 1;
+        }
+    }
+    Aws::ShutdownAPI(options);
+    return ret;
+}
+#endif
+int main(int argc, char** argv) {
+    Aws::SDKOptions options;
+    Aws::InitAPI(options);
+    {
+        std::string endpointUrl;
+        std::vector<std::string> positionalArgs;
+
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--endpoint-url" && i + 1 < argc) {
+                endpointUrl = argv[++i];
+            } else {
+                positionalArgs.push_back(arg);
+            }
+        }
+
+        if (positionalArgs.size() != 2) {
+            std::cerr << "Usage:\n"
+                      << "  cloudcp [--endpoint-url <url>] /path/to/file s3://bucket/key\n"
+                      << "  cloudcp [--endpoint-url <url>] s3://bucket/key /path/to/file\n";
+            Aws::ShutdownAPI(options);
+            return 1;
+        }
+
+        std::string src = positionalArgs[0];
+        std::string dst = positionalArgs[1];
+
+        std::shared_ptr<Aws::S3::S3Client> s3Client = CreateS3Client(endpointUrl);
+        std::shared_ptr<Aws::Transfer::TransferManager> transferManager = CreateTransferManager(s3Client);
+
+        std::string bucket, key;
+        if (parseS3Uri(src, bucket, key)) {
+            // Download
+            if (!DownloadFile(bucket, key, dst, transferManager)) {
+                Aws::ShutdownAPI(options);
+                return 1;
+            }
+        } else if (parseS3Uri(dst, bucket, key)) {
+            // Upload
+            if (!UploadFile(src, bucket, key, transferManager)) {
+                Aws::ShutdownAPI(options);
+                return 1;
+            }
+        } else {
+            std::cerr << "Invalid source or destination. One must be s3://bucket/key\n";
+            Aws::ShutdownAPI(options);
+            return 1;
+        }
+    }
+    Aws::ShutdownAPI(options);
+    return 0;
+}

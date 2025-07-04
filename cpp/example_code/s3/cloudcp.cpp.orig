@@ -1,0 +1,141 @@
+#include <aws/core/Aws.h>
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/GetObjectRequest.h>
+#include <aws/s3/model/PutObjectRequest.h>
+#include <aws/core/utils/FileSystemUtils.h>
+#include <aws/core/utils/StringUtils.h>
+#include <aws/core/utils/memory/stl/AWSStringStream.h>
+#include <fstream>
+#include <iostream>
+#include <regex>
+#include <sys/stat.h>
+#include <dirent.h>
+
+bool parseS3Uri(const std::string& uri, std::string& bucket, std::string& key) {
+    const std::string prefix = "s3://";
+    if (uri.substr(0, prefix.length()) != prefix) return false;
+    std::string rest = uri.substr(prefix.length());
+    size_t slash = rest.find('/');
+    if (slash == std::string::npos) return false;
+    bucket = rest.substr(0, slash);
+    key = rest.substr(slash + 1);
+    return true;
+}
+
+// Upload file to S3
+bool UploadFile(const std::string& filePath, const std::string& bucket, const std::string& key, const std::string& endpoint) {
+    Aws::S3::S3Client client(Aws::Client::ClientConfiguration{.endpointOverride = endpoint, .scheme = Aws::Http::Scheme::HTTP});
+    Aws::S3::Model::PutObjectRequest request;
+    request.SetBucket(bucket);
+    request.SetKey(key);
+
+    std::shared_ptr<Aws::IOStream> input_data = Aws::MakeShared<Aws::FStream>("UploadTag", filePath.c_str(), std::ios_base::in | std::ios_base::binary);
+    request.SetBody(input_data);
+
+    auto outcome = client.PutObject(request);
+    if (!outcome.IsSuccess()) {
+        std::cerr << "Upload failed: " << outcome.GetError().GetMessage() << "\n";
+        return false;
+    }
+    return true;
+}
+
+// Recursively upload directory
+void UploadDirectory(const std::string& localPath, const std::string& bucket, const std::string& endpoint, const std::string& prefix = "") {
+    DIR* dir = opendir(localPath.c_str());
+    if (!dir) return;
+    struct dirent* entry;
+    while ((entry = readdir(dir))) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        std::string fullPath = localPath + "/" + name;
+        struct stat st;
+        stat(fullPath.c_str(), &st);
+        if (S_ISDIR(st.st_mode)) {
+            UploadDirectory(fullPath, bucket, endpoint, prefix + name + "/");
+        } else {
+            UploadFile(fullPath, bucket, prefix + name, endpoint);
+        }
+    }
+    closedir(dir);
+}
+
+// Download S3 object to file
+bool DownloadFile(const std::string& bucket, const std::string& key, const std::string& endpoint, const std::string& outputDir) {
+    Aws::S3::S3Client client(Aws::Client::ClientConfiguration{.endpointOverride = endpoint, .scheme = Aws::Http::Scheme::HTTP});
+    Aws::S3::Model::GetObjectRequest request;
+    request.SetBucket(bucket);
+    request.SetKey(key);
+
+    auto outcome = client.GetObject(request);
+    if (!outcome.IsSuccess()) {
+        std::cerr << "Download failed: " << outcome.GetError().GetMessage() << "\n";
+        return false;
+    }
+
+    std::string outputPath = outputDir + "/" + key;
+    std::ofstream output(outputPath, std::ios::binary);
+    output << outcome.GetResultWithOwnership().GetBody().rdbuf();
+    output.close();
+    return true;
+}
+
+int main(int argc, char** argv) {
+    Aws::SDKOptions options;
+    Aws::InitAPI(options);
+    {
+        std::string endpointUrl;
+        std::vector<std::string> positionalArgs;
+
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--endpoint-url" && i + 1 < argc) {
+                endpointUrl = argv[++i];
+            } else {
+                positionalArgs.push_back(arg);
+            }
+        }
+
+        if (positionalArgs.size() != 2) {
+            std::cerr << "Usage:\n"
+                      << "  cloudcp [--endpoint-url <url>] /path/to/file s3://bucket/key\n"
+                      << "  cloudcp [--endpoint-url <url>] s3://bucket/key /path/to/file\n";
+            Aws::ShutdownAPI(options);
+            return 1;
+        }
+
+        std::string src = positionalArgs[0];
+        std::string dst = positionalArgs[1];
+
+        Aws::Client::ClientConfiguration config;
+        if (!endpointUrl.empty()) {
+            config.endpointOverride = endpointUrl.c_str();
+            config.scheme = Aws::Http::Scheme::HTTP;
+            config.verifySSL = false;
+        }
+
+        Aws::S3::S3Client s3(config);
+
+        std::string bucket, key;
+        if (parseS3Uri(src, bucket, key)) {
+            // Download
+            if (!downloadFile(s3, bucket, key, dst)) {
+                Aws::ShutdownAPI(options);
+                return 1;
+            }
+        } else if (parseS3Uri(dst, bucket, key)) {
+            // Upload
+            if (!uploadFile(s3, src, bucket, key)) {
+                Aws::ShutdownAPI(options);
+                return 1;
+            }
+        } else {
+            std::cerr << "Invalid source or destination. One must be s3://bucket/key\n";
+            Aws::ShutdownAPI(options);
+            return 1;
+        }
+    }
+    Aws::ShutdownAPI(options);
+    return 0;
+}

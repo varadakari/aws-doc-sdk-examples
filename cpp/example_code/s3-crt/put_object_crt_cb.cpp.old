@@ -1,0 +1,508 @@
+#include <aws/crt/Api.h>
+#include <aws/crt/Types.h>
+#include <aws/crt/io/TlsOptions.h>
+#include <aws/crt/crypto/Hash.h>
+#include <aws/crt/crypto/HMAC.h>
+#include <aws/s3-crt/S3CrtClient.h>
+#include <aws/s3-crt/model/PutObjectRequest.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/utils/logging/ConsoleLogSystem.h>
+#include <aws/core/utils/logging/LogMacros.h>
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#include <memory>
+#include <stdexcept>
+#include <iostream>
+
+using namespace Aws::Crt;
+using namespace Aws::Crt::Crypto;
+using namespace Aws::Crt::Io;
+using namespace Aws::S3Crt;
+using namespace Aws::Auth;
+
+// Helper to throw runtime_error with OpenSSL error details
+static void ThrowOpenSSLError(const char* msg)
+{
+    unsigned long errCode = ERR_get_error();
+    char errBuf[256];
+    ERR_error_string_n(errCode, errBuf, sizeof(errBuf));
+    throw std::runtime_error(std::string(msg) + ": " + errBuf);
+}
+
+// --- OpenSSL SHA256 implementation of ByoHash ---
+/*
+class OpenSSL_SHA256_ByoHash : public ByoHash
+{
+public:
+    explicit OpenSSL_SHA256_ByoHash(Allocator *allocator = ApiAllocator())
+        : ByoHash(EVP_MD_size(EVP_sha256()), allocator), ctx_(nullptr)
+    {
+        ctx_ = EVP_MD_CTX_new();
+        if (!ctx_)
+        {
+            m_hashValue.good = false;
+            std::cerr << "EVP_MD_CTX_new failed" << std::endl;
+            return;
+        }
+        if (EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) != 1)
+        {
+            m_hashValue.good = false;
+            EVP_MD_CTX_free(ctx_);
+            ctx_ = nullptr;
+            std::cerr << "EVP_DigestInit_ex failed" << std::endl;
+        }
+    }
+
+    ~OpenSSL_SHA256_ByoHash() override
+    {
+        if (ctx_)
+            EVP_MD_CTX_free(ctx_);
+    }
+
+protected:
+    bool UpdateInternal(const ByteCursor &toHash) noexcept override
+    {
+        if (!ctx_)
+            return false;
+        return EVP_DigestUpdate(ctx_, toHash.ptr, toHash.len) == 1;
+    }
+
+    bool DigestInternal(ByteBuf &output, size_t truncateTo = 0) noexcept override
+    {
+        if (!ctx_)
+            return false;
+
+        unsigned int len = 0;
+
+        // Allocate output buffer if needed
+        if (output.buffer == nullptr || output.capacity < EVP_MD_size(EVP_sha256()))
+        {
+            if (ByteBufReserve(&output, EVP_MD_size(EVP_sha256())) != AWS_OP_SUCCESS)
+                return false;
+        }
+
+        if (EVP_DigestFinal_ex(ctx_, output.buffer, &len) != 1)
+            return false;
+
+        if (truncateTo > 0 && truncateTo < len)
+            len = static_cast<unsigned int>(truncateTo);
+
+        output.len = len;
+
+        // Prevent reuse
+        EVP_MD_CTX_free(ctx_);
+        ctx_ = nullptr;
+
+        return true;
+    }
+
+private:
+    EVP_MD_CTX *ctx_;
+};
+*/
+class OpenSSL_SHA256_ByoHash : public ByoHash
+{
+public:
+    explicit OpenSSL_SHA256_ByoHash(Allocator *allocator = ApiAllocator())
+        : ByoHash(EVP_MD_size(EVP_sha256()), allocator), ctx_(nullptr), valid_(true)
+    {
+        ctx_ = EVP_MD_CTX_new();
+        if (!ctx_)
+        {
+            valid_ = false;
+            std::cerr << "EVP_MD_CTX_new failed" << std::endl;
+            return;
+        }
+        if (EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) != 1)
+        {
+            valid_ = false;
+            EVP_MD_CTX_free(ctx_);
+            ctx_ = nullptr;
+            std::cerr << "EVP_DigestInit_ex failed" << std::endl;
+        }
+    }
+
+    ~OpenSSL_SHA256_ByoHash() override
+    {
+        if (ctx_)
+            EVP_MD_CTX_free(ctx_);
+    }
+
+protected:
+    bool UpdateInternal(const ByteCursor &toHash) noexcept override
+    {
+        if (!valid_ || !ctx_)
+            return false;
+        return EVP_DigestUpdate(ctx_, toHash.ptr, toHash.len) == 1;
+    }
+
+    bool DigestInternal(ByteBuf &output, size_t truncateTo = 0) noexcept override
+    {
+        if (!valid_ || !ctx_)
+            return false;
+
+        unsigned int len = 0;
+
+        if (output.buffer == nullptr || output.capacity < EVP_MD_size(EVP_sha256()))
+        {
+            if (ByteBufReserve(&output, EVP_MD_size(EVP_sha256())) != AWS_OP_SUCCESS)
+                return false;
+        }
+
+        if (EVP_DigestFinal_ex(ctx_, output.buffer, &len) != 1)
+            return false;
+
+        if (truncateTo > 0 && truncateTo < len)
+            len = static_cast<unsigned int>(truncateTo);
+
+        output.len = len;
+
+        EVP_MD_CTX_free(ctx_);
+        ctx_ = nullptr;
+
+        return true;
+    }
+
+private:
+    EVP_MD_CTX *ctx_;
+    bool valid_;
+};
+
+
+// --- OpenSSL SHA256 HMAC implementation ---
+class OpenSSL_SHA256_ByoHMAC : public Aws::Crt::Crypto::ByoHMAC
+{
+public:
+    OpenSSL_SHA256_ByoHMAC(const ByteCursor &secret, Allocator *allocator = ApiAllocator())
+        : ByoHMAC(EVP_MD_size(EVP_sha256()), allocator), ctx_(nullptr)
+    {
+        ctx_ = HMAC_CTX_new();
+        if (!ctx_)
+        {
+            m_hmacValue.good = false;
+            std::cerr << "HMAC_CTX_new failed" << std::endl;
+            return;
+        }
+        if (HMAC_Init_ex(ctx_, secret.ptr, static_cast<int>(secret.len), EVP_sha256(), nullptr) != 1)
+        {
+            m_hmacValue.good = false;
+            HMAC_CTX_free(ctx_);
+            ctx_ = nullptr;
+            std::cerr << "HMAC_Init_ex failed" << std::endl;
+        }
+    }
+
+    ~OpenSSL_SHA256_ByoHMAC() override
+    {
+        if (ctx_)
+            HMAC_CTX_free(ctx_);
+    }
+
+protected:
+    bool UpdateInternal(const ByteCursor &toHash) noexcept override
+    {
+        if (!ctx_)
+            return false;
+        return HMAC_Update(ctx_, toHash.ptr, toHash.len) == 1;
+    }
+
+    bool DigestInternal(ByteBuf &output, size_t truncateTo = 0) noexcept override
+    {
+        if (!ctx_)
+            return false;
+
+        unsigned int len = 0;
+
+        if (output.buffer == nullptr || output.capacity < EVP_MD_size(EVP_sha256()))
+        {
+            if (ByteBufReserve(&output, EVP_MD_size(EVP_sha256())) != AWS_OP_SUCCESS)
+                return false;
+        }
+
+        if (HMAC_Final(ctx_, output.buffer, &len) != 1)
+            return false;
+
+        if (truncateTo > 0 && truncateTo < len)
+            len = static_cast<unsigned int>(truncateTo);
+
+        output.len = len;
+
+        HMAC_CTX_free(ctx_);
+        ctx_ = nullptr;
+
+        return true;
+    }
+
+private:
+    HMAC_CTX *ctx_;
+};
+
+// --- TLS context creation with KTLS enabled ---
+static std::shared_ptr<TlsContext> OpenSSL_NewTlsContext(const TlsContextOptions &options)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx)
+        ThrowOpenSSLError("SSL_CTX_new failed");
+
+    // Enable KTLS support (Linux kernel 5.6+, OpenSSL 1.1.1+)
+    long opts = SSL_CTX_get_options(ctx);
+    opts |= SSL_OP_ENABLE_KTLS;
+    SSL_CTX_set_options(ctx, opts);
+
+    // Force TLS 1.2 for RX KTLS support (optional)
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+
+    TlsContextOptions tlsOptions = options;
+    try
+    {
+        return std::make_shared<TlsContext>(tlsOptions, TlsMode::CLIENT);
+    }
+    catch (const std::exception &e)
+    {
+        SSL_CTX_free(ctx);
+        std::cerr << "Failed to create TlsContext: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
+static void OpenSSL_DeleteTlsContext(TlsContext *context)
+{
+    delete context;
+}
+
+static bool OpenSSL_IsAlpnSupported()
+{
+    return true;
+}
+
+int main(int argc, char **argv) {
+{
+    Aws::SDKOptions options;
+    options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
+    // Create a ConsoleLogSystem with desired log level
+    auto consoleLogger = Aws::MakeShared<Aws::Utils::Logging::ConsoleLogSystem>("ConsoleLogger", Aws::Utils::Logging::LogLevel::Trace);
+
+    // Set the logger in SDK options
+    options.loggingOptions.logger_create_fn = [consoleLogger]() { return consoleLogger; };
+    Aws::InitAPI(options);
+
+    // Initialize OpenSSL
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
+    SSL_load_error_strings();
+
+    try
+    {
+        ApiHandle &apiHandle = ApiHandle::GetOrCreateDefaultApiHandle();
+
+        // Register BYO_CRYPTO callbacks
+        apiHandle.SetBYOCryptoNewSHA256Callback(
+            [](size_t digestSize, Allocator *allocator) -> std::shared_ptr<ByoHash> {
+                return std::make_shared<OpenSSL_SHA256_ByoHash>(allocator);
+            });
+
+        apiHandle.SetBYOCryptoNewSHA256HMACCallback(
+            [](Allocator *allocator, const ByteCursor &secret) -> std::shared_ptr<ByoHMAC> {
+                return std::make_shared<OpenSSL_SHA256_ByoHMAC>(secret, allocator);
+            });
+
+        apiHandle.SetBYOCryptoTlsContextCallbacks(
+            OpenSSL_NewTlsContext,
+            OpenSSL_DeleteTlsContext,
+            OpenSSL_IsAlpnSupported);
+
+        std::cout << "Registered OpenSSL BYO_CRYPTO callbacks with KTLS TLS context." << std::endl;
+
+
+        if (argc < 5) {
+            std::cerr << argv[0] << " <bucket> <key> <file> <endpoint|none>\n";
+            return 1;
+        }
+
+        Aws::String bucket_name = argv[1];
+        Aws::String object_key = argv[2];
+        Aws::String file_name = argv[3];
+        Aws::String endpoint_url = argv[4];
+
+        Aws::S3Crt::S3CrtClientConfiguration clientConfig;
+	clientConfig.region = "us-west-1";
+        clientConfig.scheme = Aws::Http::Scheme::HTTPS;
+        clientConfig.verifySSL = true; // use with caution
+        clientConfig.useVirtualAddressing = false; // for non-AWS S3
+	clientConfig.caFile = "/usr/local/share/ca-certificates/minio.crt";
+	clientConfig.enableTcpKeepAlive = true;
+        clientConfig.tcpKeepAliveIntervalMs = 30000;
+        //clientConfig.connectTimeoutMs = 3000;
+        //clientConfig.requestTimeoutMs = 5000;
+
+        if (endpoint_url != "none") {
+            std::cout << "Setting up endpoint url " << endpoint_url << std::endl;
+            clientConfig.endpointOverride = endpoint_url;
+        }
+
+	Aws::Auth::AWSCredentials creds("minioadmin", "minioadmin"); // or your MinIO access key & secret
+								     //
+								     //
+        //if AWS
+	//auto credentialsProvider = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>("S3Upload");
+        //Aws::S3Crt::S3CrtClient s3crt_client(credentialsProvider, clientConfig);
+	//else
+	Aws::S3Crt::S3CrtClient s3crt_client(creds, clientConfig);
+
+        Aws::S3Crt::Model::PutObjectRequest request;
+        request.SetBucket(bucket_name);
+        request.SetKey(object_key);
+
+        auto input_data = Aws::MakeShared<Aws::FStream>("PutObjectInputStream", file_name.c_str(),
+                            std::ios_base::in | std::ios_base::binary);
+
+        if (!input_data->good()) {
+            std::cerr << "Failed to open file " << file_name << std::endl;
+            return 1;
+        }
+
+        request.SetBody(input_data);
+
+        std::cout << "Uploading object...\n";
+        auto outcome = s3crt_client.PutObject(request);
+
+        if (outcome.IsSuccess()) {
+            std::cout << "Successfully uploaded " << object_key << " to " << bucket_name << std::endl;
+        } else {
+            std::cerr << "Upload failed: " << outcome.GetError().GetMessage() << std::endl;
+        }
+
+        Aws::ShutdownAPI(options);
+        Aws::Utils::Logging::ShutdownAWSLogging();
+
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Exception: " << ex.what() << std::endl;
+        return 1;
+    }
+
+    EVP_cleanup();
+    ERR_free_strings();
+
+    return 0;
+}
+
+/*
+int main(int argc, char **argv) {
+{
+    Aws::SDKOptions options;
+    options.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
+    // Create a ConsoleLogSystem with desired log level
+    auto consoleLogger = Aws::MakeShared<Aws::Utils::Logging::ConsoleLogSystem>("ConsoleLogger", Aws::Utils::Logging::LogLevel::Trace);
+
+    // Set the logger in SDK options
+    options.loggingOptions.logger_create_fn = [consoleLogger]() { return consoleLogger; };
+    Aws::InitAPI(options);
+    // Initialize OpenSSL algorithms and error strings
+    OpenSSL_add_all_algorithms();
+    ERR_load_crypto_strings();
+    SSL_load_error_strings();
+
+    try
+    {
+        // Get global/default ApiHandle singleton
+        ApiHandle &globalApiHandle = ApiHandle::GetOrCreateDefaultApiHandle();
+
+        // Register BYO_CRYPTO callbacks on global ApiHandle
+        globalApiHandle.SetBYOCryptoNewSHA256Callback(
+            [](Allocator *allocator) -> std::shared_ptr<Hash> {
+                return std::shared_ptr<Hash>(new OpenSSL_SHA256_Hash(allocator));
+            });
+
+        globalApiHandle.SetBYOCryptoNewSHA256HMACCallback(
+            [](Allocator *allocator, const ByteCursor &secret) -> std::shared_ptr<HMAC> {
+                return std::shared_ptr<HMAC>(new OpenSSL_SHA256_HMAC(secret, allocator));
+            });
+
+        globalApiHandle.SetBYOCryptoTlsContextCallbacks(
+            OpenSSL_NewTlsContext,
+            OpenSSL_DeleteTlsContext,
+            OpenSSL_IsAlpnSupported);
+
+        std::cout << "BYO_CRYPTO OpenSSL with KTLS callbacks registered on global ApiHandle." << std::endl;
+
+        if (argc < 5) {
+            std::cerr << argv[0] << " <bucket> <key> <file> <endpoint|none>\n";
+            return 1;
+        }
+
+        Aws::String bucket_name = argv[1];
+        Aws::String object_key = argv[2];
+        Aws::String file_name = argv[3];
+        Aws::String endpoint_url = argv[4];
+
+        Aws::S3Crt::S3CrtClientConfiguration clientConfig;
+	clientConfig.region = "us-west-1";
+        clientConfig.scheme = Aws::Http::Scheme::HTTPS;
+        clientConfig.verifySSL = true; // use with caution
+        clientConfig.useVirtualAddressing = false; // for non-AWS S3
+	clientConfig.caFile = "/usr/local/share/ca-certificates/minio.crt";
+	clientConfig.enableTcpKeepAlive = true;
+        clientConfig.tcpKeepAliveIntervalMs = 30000;
+        //clientConfig.connectTimeoutMs = 3000;
+        //clientConfig.requestTimeoutMs = 5000;
+
+        if (endpoint_url != "none") {
+            std::cout << "Setting up endpoint url " << endpoint_url << std::endl;
+            clientConfig.endpointOverride = endpoint_url;
+        }
+
+	Aws::Auth::AWSCredentials creds("minioadmin", "minioadmin"); // or your MinIO access key & secret
+								     //
+								     //
+        //if AWS
+	//auto credentialsProvider = Aws::MakeShared<Aws::Auth::DefaultAWSCredentialsProviderChain>("S3Upload");
+        //Aws::S3Crt::S3CrtClient s3crt_client(credentialsProvider, clientConfig);
+	//else
+	Aws::S3Crt::S3CrtClient s3crt_client(creds, clientConfig);
+
+        Aws::S3Crt::Model::PutObjectRequest request;
+        request.SetBucket(bucket_name);
+        request.SetKey(object_key);
+
+        auto input_data = Aws::MakeShared<Aws::FStream>("PutObjectInputStream", file_name.c_str(),
+                            std::ios_base::in | std::ios_base::binary);
+
+        if (!input_data->good()) {
+            std::cerr << "Failed to open file " << file_name << std::endl;
+            return 1;
+        }
+
+        request.SetBody(input_data);
+
+        std::cout << "Uploading object...\n";
+        auto outcome = s3crt_client.PutObject(request);
+
+        if (outcome.IsSuccess()) {
+            std::cout << "Successfully uploaded " << object_key << " to " << bucket_name << std::endl;
+        } else {
+            std::cerr << "Upload failed: " << outcome.GetError().GetMessage() << std::endl;
+        }
+
+        Aws::ShutdownAPI(options);
+        Aws::Utils::Logging::ShutdownAWSLogging();
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Exception: " << ex.what() << std::endl;
+        return 1;
+    }
+
+    // Cleanup OpenSSL
+    EVP_cleanup();
+    ERR_free_strings();
+
+    return 0;
+}
+*/
